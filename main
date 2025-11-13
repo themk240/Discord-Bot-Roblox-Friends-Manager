@@ -1,0 +1,601 @@
+import discord
+from discord.ext import tasks, commands
+import asyncio
+import aiohttp
+import json
+from datetime import datetime
+from typing import Optional
+from io import BytesIO
+
+class RobloxClient:
+    def __init__(self):
+        self.s: Optional[aiohttp.ClientSession] = None
+        self.csrf = None
+        self._cookie = None
+        
+    async def __aenter__(self):
+        self.s = aiohttp.ClientSession(headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", 
+            "Accept": "application/json"
+        })
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.s:
+            await self.s.close()
+    
+    def set_cookie(self, roblosec: str):
+        self._cookie = roblosec.strip()
+    
+    async def _ensure_csrf(self):
+        if self.csrf:
+            return
+            
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        async with self.s.post("https://auth.roblox.com/v2/logout", 
+                              cookies={".ROBLOSECURITY": self._cookie}) as r:
+            token = r.headers.get("x-csrf-token") or r.headers.get("X-Csrf-Token")
+            if token:
+                self.csrf = token
+            else:
+                raise RuntimeError("No se pudo obtener token CSRF")
+    
+    async def _post_csrf(self, url, **kwargs):
+        await self._ensure_csrf()
+        
+        if "cookies" not in kwargs:
+            kwargs["cookies"] = {".ROBLOSECURITY": self._cookie}
+        if "headers" not in kwargs:
+            kwargs["headers"] = {}
+        kwargs["headers"]["X-Csrf-Token"] = self.csrf
+        
+        async with self.s.post(url, **kwargs) as r:
+            if r.status == 403:
+                token = r.headers.get("x-csrf-token") or r.headers.get("X-Csrf-Token")
+                if token:
+                    self.csrf = token
+                    kwargs["headers"]["X-Csrf-Token"] = token
+                    async with self.s.post(url, **kwargs) as r2:
+                        return r2
+            return r
+    
+    async def whoami(self):
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        async with self.s.get("https://users.roblox.com/v1/users/authenticated",
+                            cookies={".ROBLOSECURITY": self._cookie},
+                            timeout=aiohttp.ClientTimeout(total=12)) as r:
+            if r.status == 401:
+                raise RuntimeError("Token inválido o expirado (Error 401)")
+            r.raise_for_status()
+            return await r.json()
+    
+    async def get_pending_count(self) -> int:
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        async with self.s.get("https://friends.roblox.com/v1/user/friend-requests/count",
+                            cookies={".ROBLOSECURITY": self._cookie},
+                            timeout=aiohttp.ClientTimeout(total=12)) as r:
+            if r.status in (429, 502, 503, 504):
+                await asyncio.sleep(1.0)
+                async with self.s.get("https://friends.roblox.com/v1/user/friend-requests/count",
+                                    cookies={".ROBLOSECURITY": self._cookie}) as r2:
+                    r2.raise_for_status()
+                    data = await r2.json()
+                    return int(data.get("count", 0))
+            r.raise_for_status()
+            data = await r.json()
+            return int(data.get("count", 0))
+    
+    async def iter_pending_requests(self, limit=100):
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        cursor = None
+        while True:
+            params = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+                
+            async with self.s.get("https://friends.roblox.com/v1/my/friends/requests",
+                                params=params,
+                                cookies={".ROBLOSECURITY": self._cookie},
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status in (429, 502, 503, 504):
+                    await asyncio.sleep(1.0)
+                    continue
+                    
+                r.raise_for_status()
+                payload = await r.json()
+                
+                for it in payload.get("data", []):
+                    yield it
+                    
+                cursor = payload.get("nextPageCursor")
+                if not cursor:
+                    break
+    
+    async def get_user_info(self, user_id: int):
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        async with self.s.get(f"https://users.roblox.com/v1/users/{user_id}",
+                            cookies={".ROBLOSECURITY": self._cookie},
+                            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                return await r.json()
+            return {"id": user_id, "name": "?", "displayName": ""}
+    
+    async def get_avatar_image(self, user_id: int):
+        if not self.s:
+            raise RuntimeError("Session not initialized")
+            
+        url = f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=150x150&format=Png&isCircular=true"
+        
+        async with self.s.get(url,
+                            cookies={".ROBLOSECURITY": self._cookie},
+                            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+                
+            data = await r.json()
+            try:
+                image_url = data["data"][0]["imageUrl"]
+            except (KeyError, IndexError):
+                return None
+                
+            if not image_url:
+                return None
+                
+            async with self.s.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as img_resp:
+                if img_resp.status != 200:
+                    return None
+                image_data = await img_resp.read()
+                return image_data
+    
+    async def accept_request(self, user_id: int):
+        url = f"https://friends.roblox.com/v1/users/{user_id}/accept-friend-request"
+        response = await self._post_csrf(url, timeout=aiohttp.ClientTimeout(total=12))
+        return response
+    
+    async def decline_request(self, user_id: int):
+        url = f"https://friends.roblox.com/v1/users/{user_id}/decline-friend-request"
+        response = await self._post_csrf(url, timeout=aiohttp.ClientTimeout(total=12))
+        return response
+
+class RobloxBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix='!', intents=intents)
+        
+        self.auto_mode = None
+        self.auto_task = None
+        self.monitor_task = None
+        self.user_data = {}
+        self.processed_requests = set()
+        self.notification_channel = None
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("Bot listo y comandos sincronizados!")
+
+bot = RobloxBot()
+
+@bot.event
+async def on_ready():
+    print(f'✅ Bot conectado como {bot.user}')
+    print(f'🔗 Invita el bot con: https://discord.com/oauth2/authorize?client_id={bot.user.id}&scope=bot%20applications.commands')
+    
+    if not bot.monitor_task or bot.monitor_task.done():
+        bot.monitor_task = asyncio.create_task(monitor_new_requests())
+
+async def monitor_new_requests():
+    while True:
+        try:
+            for user_id, user_data in list(bot.user_data.items()):
+                if not user_data.get('cookie'):
+                    continue
+                    
+                try:
+                    async with RobloxClient() as client:
+                        client.set_cookie(user_data['cookie'])
+                        current_requests = []
+                        
+                        async for req in client.iter_pending_requests():
+                            request_id = req.get('id') or req.get('userId')
+                            current_requests.append(request_id)
+                            
+                            if request_id not in bot.processed_requests:
+                                bot.processed_requests.add(request_id)
+                                await send_request_notification(user_id, request_id, client, user_data)
+                        
+                        bot.processed_requests = {req_id for req_id in bot.processed_requests if req_id in current_requests}
+                        
+                except Exception as e:
+                    print(f"Error monitoreando solicitudes para usuario {user_id}: {e}")
+            
+            await asyncio.sleep(10)
+            
+        except Exception as e:
+            print(f"Error en monitor_new_requests: {e}")
+            await asyncio.sleep(30)
+
+async def send_request_notification(discord_user_id, roblox_user_id, client, user_data):
+    try:
+        user_info = await client.get_user_info(roblox_user_id)
+        avatar_data = await client.get_avatar_image(roblox_user_id)
+        
+        embed = discord.Embed(
+            title="📬 Nueva Solicitud de Amistad",
+            color=0x00ff00,
+            timestamp=datetime.now()
+        )
+        
+        display_name = user_info.get('displayName')
+        username = user_info.get('name', '?')
+        name_display = f"{username} ({display_name})" if display_name and display_name != username else username
+        
+        embed.add_field(name="👤 Usuario", value=name_display, inline=True)
+        embed.add_field(name="🆔 ID Roblox", value=f"`{roblox_user_id}`", inline=True)
+        embed.add_field(name="⏰ Recibida", value=f"<t:{int(datetime.now().timestamp())}:R>", inline=False)
+        
+        if avatar_data:
+            avatar_file = discord.File(BytesIO(avatar_data), filename="avatar.png")
+            embed.set_thumbnail(url="attachment://avatar.png")
+        else:
+            avatar_file = None
+        
+        view = AccionSolicitudView(roblox_user_id, user_data['cookie'])
+        
+        channel_id = user_data.get('notification_channel') or user_data.get('channel_id')
+        if channel_id:
+            channel = bot.get_channel(channel_id)
+            if channel:
+                if avatar_file:
+                    message = await channel.send(
+                        f"<@{discord_user_id}> ¡Nueva solicitud de amistad!",
+                        embed=embed,
+                        view=view,
+                        file=avatar_file
+                    )
+                else:
+                    message = await channel.send(
+                        f"<@{discord_user_id}> ¡Nueva solicitud de amistad!",
+                        embed=embed,
+                        view=view
+                    )
+                
+    except Exception as e:
+        print(f"Error enviando notificación: {e}")
+
+@bot.tree.command(name="login", description="Iniciar sesión con tu token .ROBLOSECURITY")
+async def login(interaction: discord.Interaction, token: str):
+    try:
+        if not token or len(token) < 10:
+            embed = discord.Embed(
+                title="❌ Token Inválido",
+                description="El token proporcionado es demasiado corto o vacío",
+                color=0xff0000
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+            
+        await interaction.response.send_message("🔐 Verificando token...", ephemeral=True)
+        
+        async with RobloxClient() as client:
+            client.set_cookie(token)
+            user_info = await client.whoami()
+            
+            bot.user_data[interaction.user.id] = {
+                'cookie': token,
+                'channel_id': interaction.channel_id,
+                'notification_channel': interaction.channel_id,
+                'roblox_user': user_info
+            }
+            
+            async for req in client.iter_pending_requests():
+                request_id = req.get('id') or req.get('userId')
+                bot.processed_requests.add(request_id)
+            
+            embed = discord.Embed(
+                title="✅ Sesión Iniciada",
+                description=f"Conectado como **{user_info.get('name')}**\nID: `{user_info.get('id')}`\n\n📱 **Notificaciones activadas** - Recibirás embeds por cada nueva solicitud",
+                color=0x00ff00
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+    except RuntimeError as e:
+        if "401" in str(e):
+            embed = discord.Embed(
+                title="❌ Error de Autenticación",
+                description="El token .ROBLOSECURITY es inválido, expiró o no tiene permisos.",
+                color=0xff0000
+            )
+        else:
+            embed = discord.Embed(
+                title="❌ Error",
+                description=str(e),
+                color=0xff0000
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error Inesperado",
+            description=f"Ocurrió un error: {str(e)}",
+            color=0xff0000
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="canal", description="Establecer canal para notificaciones")
+async def canal(interaction: discord.Interaction):
+    user_data = bot.user_data.get(interaction.user.id)
+    if not user_data:
+        embed = discord.Embed(
+            title="❌ No Autenticado",
+            description="Primero debes iniciar sesión con `/login`",
+            color=0xff0000
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    user_data['notification_channel'] = interaction.channel_id
+    
+    embed = discord.Embed(
+        title="📱 Canal de Notificaciones Configurado",
+        description=f"Las notificaciones de nuevas solicitudes se enviarán a este canal: <#{interaction.channel_id}>",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="autoaceptar", description="Activar auto-aceptar solicitudes")
+async def autoaceptar(interaction: discord.Interaction):
+    await toggle_auto_mode(interaction, 'accept')
+
+@bot.tree.command(name="autorechazar", description="Activar auto-rechazar solicitudes")
+async def autorechazar(interaction: discord.Interaction):
+    await toggle_auto_mode(interaction, 'decline')
+
+@bot.tree.command(name="detener", description="Detener modo automático")
+async def detener(interaction: discord.Interaction):
+    bot.auto_mode = None
+    if bot.auto_task and not bot.auto_task.done():
+        bot.auto_task.cancel()
+    
+    embed = discord.Embed(
+        title="⏹️ Modo Automático Detenido",
+        color=0xff9900
+    )
+    await interaction.response.send_message(embed=embed)
+
+async def toggle_auto_mode(interaction: discord.Interaction, mode: str):
+    user_data = bot.user_data.get(interaction.user.id)
+    if not user_data or not user_data.get('cookie'):
+        embed = discord.Embed(
+            title="❌ No Autenticado",
+            description="Primero debes iniciar sesión con `/login`",
+            color=0xff0000
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    if bot.auto_task and not bot.auto_task.done():
+        bot.auto_task.cancel()
+    
+    bot.auto_mode = mode
+    
+    embed = discord.Embed(
+        title=f"🔄 Auto-{'Aceptar' if mode == 'accept' else 'Rechazar'} Activado",
+        description="El bot procesará automáticamente las nuevas solicitudes y te notificará",
+        color=0x00ff00
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    
+    bot.auto_task = asyncio.create_task(auto_process_requests(bot, user_data, mode))
+
+async def auto_process_requests(bot, user_data, mode):
+    discord_user_id = None
+    for uid, data in bot.user_data.items():
+        if data.get('cookie') == user_data['cookie']:
+            discord_user_id = uid
+            break
+    
+    while bot.auto_mode == mode:
+        try:
+            async with RobloxClient() as client:
+                client.set_cookie(user_data['cookie'])
+                
+                processed = 0
+                async for req in client.iter_pending_requests():
+                    if bot.auto_mode != mode:
+                        break
+                        
+                    user_id = req.get('id') or req.get('userId')
+                    user_info = await client.get_user_info(user_id)
+                    username = user_info.get('name', 'Unknown')
+                    display_name = user_info.get('displayName')
+                    name_display = f"{username} ({display_name})" if display_name and display_name != username else username
+                    
+                    if mode == 'accept':
+                        response = await client.accept_request(user_id)
+                        if response.status == 200:
+                            print(f"✅ Auto-aceptada solicitud de {username}")
+                            processed += 1
+                            await send_auto_action_notification(discord_user_id, user_data, user_id, name_display, 'accepted')
+                        else:
+                            print(f"❌ Error aceptando solicitud de {username}: {response.status}")
+                    elif mode == 'decline':
+                        response = await client.decline_request(user_id)
+                        if response.status == 200:
+                            print(f"❌ Auto-rechazada solicitud de {username}")
+                            processed += 1
+                            await send_auto_action_notification(discord_user_id, user_data, user_id, name_display, 'declined')
+                        else:
+                            print(f"❌ Error rechazando solicitud de {username}: {response.status}")
+                    
+                    await asyncio.sleep(2)
+                
+                if processed > 0:
+                    print(f"🔄 Procesadas {processed} solicitudes en modo {mode}")
+                
+                await asyncio.sleep(15)
+                
+        except Exception as e:
+            print(f"Error en auto-process: {e}")
+            await asyncio.sleep(30)
+
+async def send_auto_action_notification(discord_user_id, user_data, roblox_user_id, username, action):
+    try:
+        channel_id = user_data.get('notification_channel') or user_data.get('channel_id')
+        if not channel_id:
+            return
+            
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            return
+        
+        color = 0x00ff00 if action == 'accepted' else 0xff0000
+        emoji = "✅" if action == 'accepted' else "❌"
+        action_text = "aceptada" if action == 'accepted' else "rechazada"
+        
+        embed = discord.Embed(
+            title=f"{emoji} Solicitud {action_text} Automáticamente",
+            description=f"**Usuario:** {username}\n**ID:** `{roblox_user_id}`",
+            color=color,
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text="Modo automático activado")
+        
+        await channel.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error enviando notificación automática: {e}")
+
+class SolicitudesView(discord.ui.View):
+    def __init__(self, requests, cookie):
+        super().__init__(timeout=120)
+        self.requests = requests
+        self.cookie = cookie
+        
+        if requests:
+            select = SolicitudSelect(requests, cookie)
+            self.add_item(select)
+
+class SolicitudSelect(discord.ui.Select):
+    def __init__(self, requests, cookie):
+        self.requests = requests
+        self.cookie = cookie
+        
+        options = []
+        for i, req in enumerate(requests[:25]):
+            user_id = req.get('id') or req.get('userId')
+            options.append(
+                discord.SelectOption(
+                    label=f"Solicitud {i+1}",
+                    description=f"ID: {user_id}",
+                    value=str(i)
+                )
+            )
+        
+        super().__init__(
+            placeholder="Selecciona una solicitud para gestionar...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        index = int(self.values[0])
+        request = self.requests[index]
+        user_id = request.get('id') or request.get('userId')
+        
+        view = AccionSolicitudView(user_id, self.cookie)
+        
+        async with RobloxClient() as client:
+            client.set_cookie(self.cookie)
+            user_info = await client.get_user_info(user_id)
+            avatar_data = await client.get_avatar_image(user_id)
+        
+        display_name = user_info.get('displayName')
+        name_display = f"{user_info.get('name')} ({display_name})" if display_name and display_name != user_info.get('name') else user_info.get('name')
+        
+        embed = discord.Embed(
+            title="👤 Gestión de Solicitud",
+            description=f"**Usuario:** {name_display}\n**ID:** `{user_id}`",
+            color=0x0099ff
+        )
+        
+        if avatar_data:
+            avatar_file = discord.File(BytesIO(avatar_data), filename="avatar.png")
+            embed.set_thumbnail(url="attachment://avatar.png")
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
+                ephemeral=True,
+                file=avatar_file
+            )
+        else:
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
+                ephemeral=True
+            )
+
+class AccionSolicitudView(discord.ui.View):
+    def __init__(self, user_id, cookie):
+        super().__init__(timeout=30)
+        self.user_id = user_id
+        self.cookie = cookie
+
+    @discord.ui.button(label="✅ Aceptar", style=discord.ButtonStyle.success)
+    async def aceptar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            async with RobloxClient() as client:
+                client.set_cookie(self.cookie)
+                response = await client.accept_request(self.user_id)
+                
+            if response.status == 200:
+                embed = discord.Embed(
+                    title="✅ Solicitud Aceptada",
+                    color=0x00ff00
+                )
+            else:
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"No se pudo aceptar la solicitud: Código {response.status}",
+                    color=0xff0000
+                )
+                
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="❌ Rechazar", style=discord.ButtonStyle.danger)
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            async with RobloxClient() as client:
+                client.set_cookie(self.cookie)
+                response = await client.decline_request(self.user_id)
+                
+            if response.status == 200:
+                embed = discord.Embed(
+                    title="❌ Solicitud Rechazada",
+                    color=0xff0000
+                )
+            else:
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"No se pudo rechazar la solicitud: Código {response.status}",
+                    color=0xff0000
+                )
+                
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+
+if __name__ == "__main__":
+    bot.run('BOT_TOKEN')
